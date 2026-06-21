@@ -1,0 +1,5 @@
+gdown
+streamlit
+groq
+python-dotenv
+gdown
