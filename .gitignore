@@ -1,0 +1,4 @@
+ptsp_docs.db
+*.db
+*.db-shm
+*.db-wal
