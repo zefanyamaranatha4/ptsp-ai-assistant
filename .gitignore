@@ -17,3 +17,7 @@ ptsp_docs.db
 *.db
 *.db-shm
 *.db-wal
+ptsp_docs.db
+*.db
+*.db-shm
+*.db-wal
