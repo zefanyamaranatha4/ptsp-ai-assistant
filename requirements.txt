@@ -2,4 +2,10 @@ gdown
 streamlit
 groq
 python-dotenv
-gdown
+openpyxl
+python-docx
+gdowngdown
+openpyxl
+python-docx
+openpyxl
+python-docx
