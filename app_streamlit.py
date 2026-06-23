@@ -2,9 +2,10 @@ import os, sqlite3, streamlit as st
 from groq import Groq
 from dotenv import load_dotenv
 import urllib.request, urllib.parse, json, re
+from io import BytesIO
 
 DB_PATH     = './ptsp_docs.db'
-DB_DRIVE_ID = '11aXRiR5N7XDsZuGSKZmp_eVLmFyN0Z25'  # Ganti dengan File ID dari BAB 1.3
+DB_DRIVE_ID = '11aXRiR5N7XDsZuGSKZmp_eVLmFyN0Z25'
 
 if not os.path.exists(DB_PATH):
     with st.spinner('Mengunduh database (hanya sekali, mohon tunggu)...'):
@@ -13,12 +14,15 @@ if not os.path.exists(DB_PATH):
         gdown.download(url, DB_PATH, quiet=False)
     st.success('Database berhasil diunduh!')
 
+try:
+    GROQ_API_KEY = st.secrets['GROQ_API_KEY']
+    GROQ_MODEL   = st.secrets.get('GROQ_MODEL', 'llama-3.3-70b-versatile')
+except Exception:
+    load_dotenv()
+    GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+    GROQ_MODEL   = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
 
-load_dotenv()
-
-groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
-GROQ_MODEL  = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
-DB_PATH     = './ptsp_docs.db'
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 st.set_page_config(page_title='AI Assistant — PTSP', page_icon='🤖', layout='wide')
 
@@ -64,9 +68,24 @@ KAMUS = {
     'gambar':'drawing','part':'part','daftar':'list',
 }
 
+EQUIPMENT_CODES = {
+    'raw mill':    ['6R1'],
+    'coal mill':   ['6K1'],
+    'cement mill': ['6Z1'],
+    'kiln':        ['6W1'],
+    'cooler':      ['6W1', 'crossbar'],
+}
+
 def translate_query(query):
     return [KAMUS.get(w.strip('.,?!()'), w.strip('.,?!()'))
             for w in query.lower().split()]
+
+def detect_equipment_code(query):
+    query_lower = query.lower()
+    for name, codes in EQUIPMENT_CODES.items():
+        if name in query_lower:
+            return codes
+    return []
 
 def web_search(query, max_results=3):
     try:
@@ -90,7 +109,6 @@ def web_search(query, max_results=3):
         return []
 
 def check_db_has_folder_path():
-    """Cek apakah DB versi baru (ada kolom folder_path)"""
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute('SELECT folder_path FROM docs LIMIT 1')
@@ -101,30 +119,48 @@ def check_db_has_folder_path():
 
 def search_db(query, top_k=6):
     try:
-        conn      = sqlite3.connect(DB_PATH)
-        words     = translate_query(query)
-        has_fp    = check_db_has_folder_path()
+        conn   = sqlite3.connect(DB_PATH)
+        words  = translate_query(query)
+        has_fp = check_db_has_folder_path()
+        equipment_codes = detect_equipment_code(query)
         results, seen = [], set()
 
-        # Tentukan SELECT berdasarkan versi DB
         if has_fp:
             SELECT = 'SELECT file_name, file_path, content, folder_path FROM docs'
         else:
             SELECT = 'SELECT file_name, file_path, content, "" as folder_path FROM docs'
 
-        def add(rows):
+        def add(rows, boost_codes=None):
             for r in rows:
-                key = r[0] + r[2][:60]
+                fname, fpath, content = r[0], r[1], r[2]
+                fpath_folder = r[3] if len(r) > 3 else ''
+                if boost_codes:
+                    text_check = (fname + ' ' + fpath_folder + ' ' + content[:200]).upper()
+                    other_codes = [c for c in ['6R1','6K1','6Z1','6W1'] if c not in boost_codes]
+                    has_target = any(c.upper() in text_check for c in boost_codes)
+                    has_other  = any(c.upper() in text_check for c in other_codes)
+                    if has_other and not has_target:
+                        continue
+                key = fname + content[:60]
                 if key not in seen:
                     seen.add(key)
                     results.append({
-                        'file_name':   r[0],
-                        'file_path':   r[1],
-                        'content':     r[2],
-                        'folder_path': r[3] if len(r) > 3 else ''
+                        'file_name':   fname,
+                        'file_path':   fpath,
+                        'content':     content,
+                        'folder_path': fpath_folder
                     })
 
-        # Cari berdasarkan folder_path jika ada keyword folder
+        if has_fp and equipment_codes:
+            for code in equipment_codes:
+                try:
+                    rows = conn.execute(
+                        f"{SELECT} WHERE folder_path LIKE ? OR file_name LIKE ? OR content LIKE ? LIMIT ?",
+                        (f'%{code}%', f'%{code}%', f'%{code}%', top_k * 2)
+                    ).fetchall()
+                    add(rows, boost_codes=equipment_codes)
+                except: pass
+
         folder_keywords = ['qc', 'qc-form', 'qcform', 'drawing', 'manual',
                           'spesifikasi', 'specification', 'part list', 'partlist']
         query_lower = query.lower()
@@ -145,39 +181,38 @@ def search_db(query, top_k=6):
                         f"{SELECT} WHERE folder_path LIKE ? ORDER BY rank LIMIT ?",
                         (f'%{target_folder}%', top_k * 2)
                     ).fetchall()
-                    add(rows)
-                except:
-                    pass
+                    add(rows, boost_codes=equipment_codes if equipment_codes else None)
+                except: pass
 
-        # Prioritas 1: frasa 3 kata
         for i in range(len(words) - 2):
             phrase = ' '.join(words[i:i+3])
             try:
-                add(conn.execute(
+                rows = conn.execute(
                     f"{SELECT} WHERE docs MATCH ? ORDER BY rank LIMIT ?",
                     (f'"{phrase}"', top_k)
-                ).fetchall())
+                ).fetchall()
+                add(rows, boost_codes=equipment_codes if equipment_codes else None)
             except: pass
 
-        # Prioritas 2: frasa 2 kata
         for i in range(len(words) - 1):
             phrase = ' '.join(words[i:i+2])
             try:
-                add(conn.execute(
+                rows = conn.execute(
                     f"{SELECT} WHERE docs MATCH ? ORDER BY rank LIMIT ?",
                     (f'"{phrase}"', top_k)
-                ).fetchall())
+                ).fetchall()
+                add(rows, boost_codes=equipment_codes if equipment_codes else None)
             except: pass
 
-        # Prioritas 3: kata tunggal terpanjang
         if len(results) < 3:
             for word in sorted(set(words), key=len, reverse=True)[:4]:
                 if len(word) < 3: continue
                 try:
-                    add(conn.execute(
+                    rows = conn.execute(
                         f"{SELECT} WHERE docs MATCH ? ORDER BY rank LIMIT ?",
                         (word, top_k)
-                    ).fetchall())
+                    ).fetchall()
+                    add(rows, boost_codes=equipment_codes if equipment_codes else None)
                 except: pass
 
         conn.close()
@@ -193,6 +228,64 @@ def get_db_stats():
     chunks = conn.execute('SELECT COUNT(*) FROM docs').fetchone()[0]
     conn.close()
     return files, chunks
+
+def generate_excel(answer_text, sources, query):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Hasil AI Assistant"
+
+    ws['A1'] = 'Pertanyaan'
+    ws['A2'] = query
+    ws['A4'] = 'Jawaban'
+    ws['A5'] = answer_text
+
+    for cell in ['A1', 'A4']:
+        ws[cell].font = Font(bold=True, size=12, color='FFFFFF')
+        ws[cell].fill = PatternFill(start_color='1E3A5F', fill_type='solid')
+
+    ws.column_dimensions['A'].width = 100
+    ws['A2'].alignment = Alignment(wrap_text=True)
+    ws['A5'].alignment = Alignment(wrap_text=True)
+    ws.row_dimensions[5].height = 200
+
+    row = 7
+    ws[f'A{row}'] = 'Sumber Dokumen'
+    ws[f'A{row}'].font = Font(bold=True, size=12, color='FFFFFF')
+    ws[f'A{row}'].fill = PatternFill(start_color='1A5C3A', fill_type='solid')
+    row += 1
+    for s in sources:
+        ws[f'A{row}'] = f"• {s['file_name']} ({s.get('folder_path','')})"
+        row += 1
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+def generate_docx(answer_text, sources, query):
+    from docx import Document as DocxDoc
+
+    doc = DocxDoc()
+    doc.add_heading('AI Assistant — Unit Evaluasi Proses dan Energi PTSP', level=1)
+
+    doc.add_heading('Pertanyaan', level=2)
+    doc.add_paragraph(query)
+
+    doc.add_heading('Jawaban', level=2)
+    doc.add_paragraph(answer_text)
+
+    doc.add_heading('Sumber Dokumen', level=2)
+    for s in sources:
+        p = doc.add_paragraph(style='List Bullet')
+        p.add_run(f"{s['file_name']} ({s.get('folder_path','')})")
+
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
 
 files_count, chunks_count = get_db_stats()
 
@@ -251,7 +344,6 @@ if query:
                 web_query   = ' '.join(translate_query(query))
                 web_results = web_search(web_query)
 
-            # Bangun konteks dengan folder path
             ctx_parts = []
             if docs:
                 ctx_parts.append("=== DOKUMEN INTERNAL PTSP ===")
@@ -271,6 +363,17 @@ if query:
             context = '\n\n---\n\n'.join(ctx_parts)
 
             system_prompt = """Anda adalah AI Assistant teknis untuk Unit Evaluasi Proses dan Energi PTSP (pabrik semen Indarung VI).
+
+KODE EQUIPMENT (PENTING — jangan tertukar):
+- 6R1 = Raw Mill (OK Mill) — vertical roller mill untuk material mentah
+- 6K1 = Coal Mill — vertical mill untuk batu bara
+- 6Z1 = Cement Mill — vertical mill untuk semen
+- 6W1 = Kiln & Cooler — rotary kiln dan crossbar cooler
+
+Equipment dengan kode berbeda (6R1 vs 6K1 vs 6Z1 vs 6W1) adalah MESIN YANG BERBEDA
+meskipun sama-sama 'Vertical Mill'. JANGAN campurkan informasi dari kode equipment
+yang berbeda — jika user tanya soal Raw Mill (6R1), jangan jawab dengan data dari
+Coal Mill (6K1) atau Kiln (6W1) meski strukturnya serupa.
 
 STRUKTUR FOLDER DATABASE:
 - Drawing        → gambar teknis, P&ID, GA drawing
@@ -301,6 +404,26 @@ ATURAN:
                 )
                 answer = completion.choices[0].message.content
                 st.markdown(answer)
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    excel_buf = generate_excel(answer, docs, query)
+                    st.download_button(
+                        label="📊 Download Excel",
+                        data=excel_buf,
+                        file_name=f"jawaban_ai_{query[:30].replace(' ','_')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"excel_{len(st.session_state.messages)}"
+                    )
+                with col2:
+                    docx_buf = generate_docx(answer, docs, query)
+                    st.download_button(
+                        label="📄 Download Word",
+                        data=docx_buf,
+                        file_name=f"jawaban_ai_{query[:30].replace(' ','_')}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key=f"docx_{len(st.session_state.messages)}"
+                    )
 
                 if docs:
                     html = '<div class="source-box">📄 <b>Sumber:</b><br>'
