@@ -87,15 +87,6 @@ def detect_equipment_code(query):
             return codes
     return []
 
-def detect_qc_request(query):
-    """Deteksi apakah user minta daftar/keseluruhan QC Form (bukan 1 jawaban spesifik)"""
-    q = query.lower()
-    qc_words = ['qc form', 'qc-form', 'qcform']
-    bulk_words = ['keseluruhan', 'semua', 'seluruh', 'daftar', 'list', 'lengkap']
-    has_qc    = any(w in q for w in qc_words)
-    has_bulk  = any(w in q for w in bulk_words)
-    return has_qc and has_bulk
-
 def web_search(query, max_results=3):
     try:
         encoded = urllib.parse.quote(f"{query} cement plant technical specification")
@@ -125,28 +116,6 @@ def check_db_has_folder_path():
         return True
     except:
         return False
-
-def list_qc_files_for_equipment(equipment_codes, limit=200):
-    """Ambil SEMUA nama file unik di folder QC-FORM yang match equipment code"""
-    conn = sqlite3.connect(DB_PATH)
-    results, seen_files = [], set()
-    try:
-        for code in equipment_codes:
-            rows = conn.execute('''
-                SELECT DISTINCT file_name, folder_path, file_path
-                FROM docs_content
-                WHERE (folder_path LIKE '%QC%' )
-                AND (file_name LIKE ? OR folder_path LIKE ? OR content LIKE ?)
-                LIMIT ?
-            ''', (f'%{code}%', f'%{code}%', f'%{code}%', limit)).fetchall()
-            for fname, fpath, link in rows:
-                if fname not in seen_files:
-                    seen_files.add(fname)
-                    results.append({'file_name': fname, 'folder_path': fpath, 'file_path': link or ''})
-    except Exception as e:
-        pass
-    conn.close()
-    return results
 
 def search_db(query, top_k=6):
     try:
@@ -261,7 +230,6 @@ def get_db_stats():
     return files, chunks
 
 def generate_excel_answer(answer_text, sources, query):
-    """Excel berisi jawaban naratif AI (untuk pertanyaan umum)"""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
 
@@ -297,43 +265,6 @@ def generate_excel_answer(answer_text, sources, query):
     buf.seek(0)
     return buf
 
-def generate_excel_filelist(file_list, query, equipment_name=""):
-    """Excel berisi tabel daftar file QC Form (untuk permintaan daftar/keseluruhan)"""
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Daftar QC Form"
-
-    ws['A1'] = f'Daftar QC Form — {equipment_name or query}'
-    ws.merge_cells('A1:D1')
-    ws['A1'].font = Font(bold=True, size=14, color='FFFFFF')
-    ws['A1'].fill = PatternFill(start_color='1E3A5F', fill_type='solid')
-    ws['A1'].alignment = Alignment(horizontal='center')
-
-    headers = ['No', 'Nama File', 'Folder', 'Link']
-    for i, h in enumerate(headers, start=1):
-        cell = ws.cell(row=3, column=i, value=h)
-        cell.font = Font(bold=True, color='FFFFFF')
-        cell.fill = PatternFill(start_color='1A5C3A', fill_type='solid')
-
-    for idx, f in enumerate(file_list, start=1):
-        ws.cell(row=3+idx, column=1, value=idx)
-        ws.cell(row=3+idx, column=2, value=f['file_name'])
-        ws.cell(row=3+idx, column=3, value=f.get('folder_path',''))
-        ws.cell(row=3+idx, column=4, value=f.get('file_path',''))
-
-    ws.column_dimensions['A'].width = 6
-    ws.column_dimensions['B'].width = 50
-    ws.column_dimensions['C'].width = 25
-    ws.column_dimensions['D'].width = 50
-
-    buf = BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf
-
 def generate_docx(answer_text, sources, query):
     from docx import Document as DocxDoc
 
@@ -356,6 +287,163 @@ def generate_docx(answer_text, sources, query):
     buf.seek(0)
     return buf
 
+def classify_intent(query, equipment_codes):
+    prompt = f"""Analisis pertanyaan berikut dan tentukan klasifikasinya dalam format JSON murni (tanpa markdown):
+
+Pertanyaan: "{query}"
+
+Tentukan:
+1. "mode": "rekap_dokumen" jika user minta KUMPULAN/SEMUA/KESELURUHAN/REKAP dokumen dari satu kategori (misal: "semua QC Form raw mill", "rekap drawing kiln", "kumpulan part list separator"). Pilih "jawab_singkat" jika user hanya tanya 1 hal spesifik atau minta penjelasan/analisis.
+2. "format_file": "excel" jika user minta/cocok untuk Excel, "word" jika cocok dokumen Word, "tidak_ada" jika tidak perlu file.
+3. "target_folder": pilih SALAH SATU dari ["QC-FORM", "Drawing", "Manual & Spesifikasi", "Part List", null] sesuai konteks pertanyaan. null jika tidak spesifik ke satu folder.
+
+Jawab HANYA dengan JSON, contoh:
+{{"mode": "rekap_dokumen", "format_file": "excel", "target_folder": "QC-FORM"}}"""
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{'role': 'user', 'content': prompt}],
+            max_tokens=150,
+            temperature=0
+        )
+        raw = completion.choices[0].message.content.strip()
+        raw = re.sub(r'^```json\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
+        result = json.loads(raw)
+        return {
+            'mode': result.get('mode', 'jawab_singkat'),
+            'format_file': result.get('format_file', 'tidak_ada'),
+            'target_folder': result.get('target_folder')
+        }
+    except Exception:
+        return {'mode': 'jawab_singkat', 'format_file': 'tidak_ada', 'target_folder': None}
+
+def list_files_for_folder(target_folder, equipment_codes, limit=300):
+    conn = sqlite3.connect(DB_PATH)
+    results, seen_files = [], set()
+    try:
+        if target_folder:
+            if equipment_codes:
+                for code in equipment_codes:
+                    rows = conn.execute('''
+                        SELECT DISTINCT file_name, folder_path, file_path
+                        FROM docs_content
+                        WHERE folder_path LIKE ?
+                        AND (file_name LIKE ? OR folder_path LIKE ? OR content LIKE ?)
+                        LIMIT ?
+                    ''', (f'%{target_folder}%', f'%{code}%', f'%{code}%', f'%{code}%', limit)).fetchall()
+                    for fname, fpath, link in rows:
+                        if fname not in seen_files:
+                            seen_files.add(fname)
+                            results.append({'file_name': fname, 'folder_path': fpath, 'file_path': link or ''})
+            else:
+                rows = conn.execute('''
+                    SELECT DISTINCT file_name, folder_path, file_path
+                    FROM docs_content
+                    WHERE folder_path LIKE ?
+                    LIMIT ?
+                ''', (f'%{target_folder}%', limit)).fetchall()
+                for fname, fpath, link in rows:
+                    if fname not in seen_files:
+                        seen_files.add(fname)
+                        results.append({'file_name': fname, 'folder_path': fpath, 'file_path': link or ''})
+        elif equipment_codes:
+            for code in equipment_codes:
+                rows = conn.execute('''
+                    SELECT DISTINCT file_name, folder_path, file_path
+                    FROM docs_content
+                    WHERE file_name LIKE ? OR folder_path LIKE ? OR content LIKE ?
+                    LIMIT ?
+                ''', (f'%{code}%', f'%{code}%', f'%{code}%', limit)).fetchall()
+                for fname, fpath, link in rows:
+                    if fname not in seen_files:
+                        seen_files.add(fname)
+                        results.append({'file_name': fname, 'folder_path': fpath, 'file_path': link or ''})
+    except Exception:
+        pass
+    conn.close()
+    return results
+
+def generate_excel_recap(files, query, folder_label=""):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    conn = sqlite3.connect(DB_PATH)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Rekap Dokumen"
+
+    ws['A1'] = f'Rekap Dokumen — {folder_label or query}'
+    ws.merge_cells('A1:E1')
+    ws['A1'].font = Font(bold=True, size=14, color='FFFFFF')
+    ws['A1'].fill = PatternFill(start_color='1E3A5F', fill_type='solid')
+    ws['A1'].alignment = Alignment(horizontal='center')
+
+    headers = ['No', 'Nama File', 'Folder', 'Isi / Konten', 'Link Dokumen']
+    for i, h in enumerate(headers, start=1):
+        cell = ws.cell(row=3, column=i, value=h)
+        cell.font = Font(bold=True, color='FFFFFF')
+        cell.fill = PatternFill(start_color='1A5C3A', fill_type='solid')
+
+    current_row = 4
+    for idx, f in enumerate(files, start=1):
+        chunks = conn.execute('''
+            SELECT content FROM docs_content
+            WHERE file_name = ?
+            ORDER BY CAST(chunk_id AS INTEGER)
+        ''', (f['file_name'],)).fetchall()
+        full_content = ' '.join(c[0] for c in chunks).strip()
+        full_content = re.sub(r'\s+', ' ', full_content)[:2000]
+
+        ws.cell(row=current_row, column=1, value=idx)
+        ws.cell(row=current_row, column=2, value=f['file_name'])
+        ws.cell(row=current_row, column=3, value=f.get('folder_path',''))
+        c = ws.cell(row=current_row, column=4, value=full_content)
+        c.alignment = Alignment(wrap_text=True, vertical='top')
+        ws.cell(row=current_row, column=5, value=f.get('file_path',''))
+        current_row += 1
+
+    conn.close()
+    ws.column_dimensions['A'].width = 6
+    ws.column_dimensions['B'].width = 45
+    ws.column_dimensions['C'].width = 20
+    ws.column_dimensions['D'].width = 80
+    ws.column_dimensions['E'].width = 50
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+def generate_docx_recap(files, query, folder_label=""):
+    from docx import Document as DocxDoc
+
+    conn = sqlite3.connect(DB_PATH)
+    doc = DocxDoc()
+    doc.add_heading(f'Rekap Dokumen — {folder_label or query}', level=1)
+
+    for idx, f in enumerate(files, start=1):
+        chunks = conn.execute('''
+            SELECT content FROM docs_content
+            WHERE file_name = ?
+            ORDER BY CAST(chunk_id AS INTEGER)
+        ''', (f['file_name'],)).fetchall()
+        full_content = ' '.join(c[0] for c in chunks).strip()
+        full_content = re.sub(r'\s+', ' ', full_content)[:3000]
+
+        doc.add_heading(f"{idx}. {f['file_name']}", level=2)
+        doc.add_paragraph(f"Folder: {f.get('folder_path','')}")
+        doc.add_paragraph(full_content)
+        if f.get('file_path'):
+            doc.add_paragraph(f"Link: {f['file_path']}")
+        doc.add_paragraph('')
+
+    conn.close()
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
 files_count, chunks_count = get_db_stats()
 
 with st.sidebar:
@@ -369,9 +457,9 @@ with st.sidebar:
     st.markdown("**💡 Contoh Pertanyaan**")
     examples = [
         "QC Form raw mill standar apa saja?",
-        "Berikan QC Form raw mill secara keseluruhan",
+        "Berikan semua QC Form raw mill dalam excel",
         "Drawing separator raw mill",
-        "Part list gearbox raw mill",
+        "Rekap part list gearbox raw mill",
         "Hydraulic pressure setting vertical mill",
         "Troubleshooting vibration high pada mill",
         "Manual & spesifikasi OK mill",
@@ -405,44 +493,49 @@ if query:
         st.markdown(query)
 
     with st.chat_message('assistant'):
-        with st.spinner('Mencari...'):
+        with st.spinner('Memahami konteks pertanyaan...'):
             equipment_codes = detect_equipment_code(query)
-            is_bulk_qc      = detect_qc_request(query)
+            intent = classify_intent(query, equipment_codes)
 
-            # Mode khusus: permintaan daftar QC Form keseluruhan
-            if is_bulk_qc and equipment_codes:
-                qc_files = list_qc_files_for_equipment(equipment_codes)
+        if intent['mode'] == 'rekap_dokumen':
+            with st.spinner('Mengambil dan menyusun dokumen...'):
+                files = list_files_for_folder(intent['target_folder'], equipment_codes)
 
-                if qc_files:
-                    answer = f"Ditemukan **{len(qc_files)} file QC Form** untuk equipment terkait. Berikut daftar lengkapnya, juga tersedia untuk diunduh dalam format Excel:\n\n"
-                    for i, f in enumerate(qc_files[:30], 1):
-                        answer += f"{i}. {f['file_name']}\n"
-                    if len(qc_files) > 30:
-                        answer += f"\n*...dan {len(qc_files)-30} file lainnya (lihat Excel untuk daftar lengkap)*"
-                else:
-                    answer = "Mohon maaf, tidak ditemukan file QC Form untuk equipment yang dimaksud di folder QC-FORM."
-
+            if files:
+                folder_label = intent['target_folder'] or (", ".join(equipment_codes) if equipment_codes else query)
+                answer = f"Ditemukan **{len(files)} dokumen** sesuai permintaan Anda di folder **{intent['target_folder'] or 'seluruh database'}**. Isi lengkap setiap dokumen sudah disusun ke dalam file di bawah ini."
                 st.markdown(answer)
 
-                if qc_files:
-                    excel_buf = generate_excel_filelist(qc_files, query, equipment_name=", ".join(equipment_codes))
-                    st.download_button(
-                        label=f"📊 Download Excel ({len(qc_files)} file)",
-                        data=excel_buf,
-                        file_name=f"daftar_qc_form_{equipment_codes[0]}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"excel_bulk_{len(st.session_state.messages)}"
-                    )
+                with st.spinner(f'Mengekstrak isi {len(files)} dokumen...'):
+                    if intent['format_file'] == 'word':
+                        file_buf = generate_docx_recap(files, query, folder_label)
+                        st.download_button(
+                            label=f"📄 Download Word — {len(files)} Dokumen",
+                            data=file_buf,
+                            file_name=f"rekap_{folder_label.replace(' ','_')}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key=f"docx_recap_{len(st.session_state.messages)}"
+                        )
+                    else:
+                        file_buf = generate_excel_recap(files, query, folder_label)
+                        st.download_button(
+                            label=f"📊 Download Excel — {len(files)} Dokumen",
+                            data=file_buf,
+                            file_name=f"rekap_{folder_label.replace(' ','_')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"excel_recap_{len(st.session_state.messages)}"
+                        )
 
-                if qc_files:
-                    html = '<div class="source-box">📄 <b>Folder:</b> QC-FORM<br>'
-                    html += f'<b>Total file ditemukan:</b> {len(qc_files)}</div>'
-                    st.markdown(html, unsafe_allow_html=True)
-
-                st.session_state.messages.append({'role': 'assistant', 'content': answer})
-
+                html = f'<div class="source-box">📄 <b>Folder:</b> {intent["target_folder"] or "Seluruh database"}<br><b>Total dokumen:</b> {len(files)}</div>'
+                st.markdown(html, unsafe_allow_html=True)
             else:
-                # Mode normal: tanya jawab dengan AI seperti biasa
+                answer = "Mohon maaf, tidak ditemukan dokumen yang sesuai dengan permintaan Anda."
+                st.markdown(answer)
+
+            st.session_state.messages.append({'role': 'assistant', 'content': answer})
+
+        else:
+            with st.spinner('Mencari...'):
                 docs        = search_db(query)
                 web_results = []
 
@@ -478,8 +571,7 @@ KODE EQUIPMENT (PENTING — jangan tertukar):
 
 Equipment dengan kode berbeda (6R1 vs 6K1 vs 6Z1 vs 6W1) adalah MESIN YANG BERBEDA
 meskipun sama-sama 'Vertical Mill'. JANGAN campurkan informasi dari kode equipment
-yang berbeda — jika user tanya soal Raw Mill (6R1), jangan jawab dengan data dari
-Coal Mill (6K1) atau Kiln (6W1) meski strukturnya serupa.
+yang berbeda.
 
 STRUKTUR FOLDER DATABASE:
 - Drawing        → gambar teknis, P&ID, GA drawing
@@ -489,14 +581,10 @@ STRUKTUR FOLDER DATABASE:
 
 ATURAN:
 1. Prioritaskan DOKUMEN INTERNAL. Sebutkan nama file dan folder sumbernya.
-2. Jika user tanya QC Form → cari di folder QC-FORM
-3. Jika user tanya drawing/gambar → cari di folder Drawing
-4. Jika user tanya spesifikasi/manual → cari di Manual & Spesifikasi
-5. Jika user tanya part/spare → cari di Part List
-6. Referensi internet hanya untuk konteks teknis jika dokumen tidak ada
-7. Jawab Bahasa Indonesia, teknis dan formal
-8. Terjemahkan dokumen Inggris ke Indonesia dalam jawaban
-9. Jika dokumen tidak ditemukan, katakan terus terang dan sarankan folder yang tepat"""
+2. Referensi internet hanya untuk konteks teknis jika dokumen tidak ada.
+3. Jawab Bahasa Indonesia, teknis dan formal.
+4. Terjemahkan dokumen Inggris ke Indonesia dalam jawaban.
+5. Jika dokumen tidak ditemukan, katakan terus terang."""
 
                 try:
                     completion = groq_client.chat.completions.create(
@@ -511,25 +599,22 @@ ATURAN:
                     answer = completion.choices[0].message.content
                     st.markdown(answer)
 
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        excel_buf = generate_excel_answer(answer, docs, query)
-                        st.download_button(
-                            label="📊 Download Excel",
-                            data=excel_buf,
-                            file_name=f"jawaban_ai_{query[:30].replace(' ','_')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key=f"excel_{len(st.session_state.messages)}"
-                        )
-                    with col2:
-                        docx_buf = generate_docx(answer, docs, query)
-                        st.download_button(
-                            label="📄 Download Word",
-                            data=docx_buf,
-                            file_name=f"jawaban_ai_{query[:30].replace(' ','_')}.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            key=f"docx_{len(st.session_state.messages)}"
-                        )
+                    if intent['format_file'] in ('excel', 'word') and docs:
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if intent['format_file'] == 'excel':
+                                buf = generate_excel_answer(answer, docs, query)
+                                st.download_button("📊 Download Excel", data=buf,
+                                    file_name=f"jawaban_{query[:30].replace(' ','_')}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=f"excel_{len(st.session_state.messages)}")
+                        with col2:
+                            if intent['format_file'] == 'word':
+                                buf = generate_docx(answer, docs, query)
+                                st.download_button("📄 Download Word", data=buf,
+                                    file_name=f"jawaban_{query[:30].replace(' ','_')}.docx",
+                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                    key=f"docx_{len(st.session_state.messages)}")
 
                     if docs:
                         html = '<div class="source-box">📄 <b>Sumber:</b><br>'
