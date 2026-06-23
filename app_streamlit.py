@@ -87,6 +87,15 @@ def detect_equipment_code(query):
             return codes
     return []
 
+def detect_qc_request(query):
+    """Deteksi apakah user minta daftar/keseluruhan QC Form (bukan 1 jawaban spesifik)"""
+    q = query.lower()
+    qc_words = ['qc form', 'qc-form', 'qcform']
+    bulk_words = ['keseluruhan', 'semua', 'seluruh', 'daftar', 'list', 'lengkap']
+    has_qc    = any(w in q for w in qc_words)
+    has_bulk  = any(w in q for w in bulk_words)
+    return has_qc and has_bulk
+
 def web_search(query, max_results=3):
     try:
         encoded = urllib.parse.quote(f"{query} cement plant technical specification")
@@ -116,6 +125,28 @@ def check_db_has_folder_path():
         return True
     except:
         return False
+
+def list_qc_files_for_equipment(equipment_codes, limit=200):
+    """Ambil SEMUA nama file unik di folder QC-FORM yang match equipment code"""
+    conn = sqlite3.connect(DB_PATH)
+    results, seen_files = [], set()
+    try:
+        for code in equipment_codes:
+            rows = conn.execute('''
+                SELECT DISTINCT file_name, folder_path, file_path
+                FROM docs_content
+                WHERE (folder_path LIKE '%QC%' )
+                AND (file_name LIKE ? OR folder_path LIKE ? OR content LIKE ?)
+                LIMIT ?
+            ''', (f'%{code}%', f'%{code}%', f'%{code}%', limit)).fetchall()
+            for fname, fpath, link in rows:
+                if fname not in seen_files:
+                    seen_files.add(fname)
+                    results.append({'file_name': fname, 'folder_path': fpath, 'file_path': link or ''})
+    except Exception as e:
+        pass
+    conn.close()
+    return results
 
 def search_db(query, top_k=6):
     try:
@@ -229,7 +260,8 @@ def get_db_stats():
     conn.close()
     return files, chunks
 
-def generate_excel(answer_text, sources, query):
+def generate_excel_answer(answer_text, sources, query):
+    """Excel berisi jawaban naratif AI (untuk pertanyaan umum)"""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
 
@@ -259,6 +291,43 @@ def generate_excel(answer_text, sources, query):
     for s in sources:
         ws[f'A{row}'] = f"• {s['file_name']} ({s.get('folder_path','')})"
         row += 1
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+def generate_excel_filelist(file_list, query, equipment_name=""):
+    """Excel berisi tabel daftar file QC Form (untuk permintaan daftar/keseluruhan)"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Daftar QC Form"
+
+    ws['A1'] = f'Daftar QC Form — {equipment_name or query}'
+    ws.merge_cells('A1:D1')
+    ws['A1'].font = Font(bold=True, size=14, color='FFFFFF')
+    ws['A1'].fill = PatternFill(start_color='1E3A5F', fill_type='solid')
+    ws['A1'].alignment = Alignment(horizontal='center')
+
+    headers = ['No', 'Nama File', 'Folder', 'Link']
+    for i, h in enumerate(headers, start=1):
+        cell = ws.cell(row=3, column=i, value=h)
+        cell.font = Font(bold=True, color='FFFFFF')
+        cell.fill = PatternFill(start_color='1A5C3A', fill_type='solid')
+
+    for idx, f in enumerate(file_list, start=1):
+        ws.cell(row=3+idx, column=1, value=idx)
+        ws.cell(row=3+idx, column=2, value=f['file_name'])
+        ws.cell(row=3+idx, column=3, value=f.get('folder_path',''))
+        ws.cell(row=3+idx, column=4, value=f.get('file_path',''))
+
+    ws.column_dimensions['A'].width = 6
+    ws.column_dimensions['B'].width = 50
+    ws.column_dimensions['C'].width = 25
+    ws.column_dimensions['D'].width = 50
 
     buf = BytesIO()
     wb.save(buf)
@@ -300,7 +369,7 @@ with st.sidebar:
     st.markdown("**💡 Contoh Pertanyaan**")
     examples = [
         "QC Form raw mill standar apa saja?",
-        "Berapa clearance bearing roller raw mill?",
+        "Berikan QC Form raw mill secara keseluruhan",
         "Drawing separator raw mill",
         "Part list gearbox raw mill",
         "Hydraulic pressure setting vertical mill",
@@ -337,32 +406,69 @@ if query:
 
     with st.chat_message('assistant'):
         with st.spinner('Mencari...'):
-            docs        = search_db(query)
-            web_results = []
+            equipment_codes = detect_equipment_code(query)
+            is_bulk_qc      = detect_qc_request(query)
 
-            if use_web and len(docs) < 2:
-                web_query   = ' '.join(translate_query(query))
-                web_results = web_search(web_query)
+            # Mode khusus: permintaan daftar QC Form keseluruhan
+            if is_bulk_qc and equipment_codes:
+                qc_files = list_qc_files_for_equipment(equipment_codes)
 
-            ctx_parts = []
-            if docs:
-                ctx_parts.append("=== DOKUMEN INTERNAL PTSP ===")
-                for d in docs:
-                    header = f"[{d['file_name']}]"
-                    if d.get('folder_path'):
-                        header += f" (📁 {d['folder_path']})"
-                    ctx_parts.append(f"{header}\n{d['content']}")
+                if qc_files:
+                    answer = f"Ditemukan **{len(qc_files)} file QC Form** untuk equipment terkait. Berikut daftar lengkapnya, juga tersedia untuk diunduh dalam format Excel:\n\n"
+                    for i, f in enumerate(qc_files[:30], 1):
+                        answer += f"{i}. {f['file_name']}\n"
+                    if len(qc_files) > 30:
+                        answer += f"\n*...dan {len(qc_files)-30} file lainnya (lihat Excel untuk daftar lengkap)*"
+                else:
+                    answer = "Mohon maaf, tidak ditemukan file QC Form untuk equipment yang dimaksud di folder QC-FORM."
+
+                st.markdown(answer)
+
+                if qc_files:
+                    excel_buf = generate_excel_filelist(qc_files, query, equipment_name=", ".join(equipment_codes))
+                    st.download_button(
+                        label=f"📊 Download Excel ({len(qc_files)} file)",
+                        data=excel_buf,
+                        file_name=f"daftar_qc_form_{equipment_codes[0]}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"excel_bulk_{len(st.session_state.messages)}"
+                    )
+
+                if qc_files:
+                    html = '<div class="source-box">📄 <b>Folder:</b> QC-FORM<br>'
+                    html += f'<b>Total file ditemukan:</b> {len(qc_files)}</div>'
+                    st.markdown(html, unsafe_allow_html=True)
+
+                st.session_state.messages.append({'role': 'assistant', 'content': answer})
+
             else:
-                ctx_parts.append("=== DOKUMEN INTERNAL ===\nTidak ada dokumen relevan.")
+                # Mode normal: tanya jawab dengan AI seperti biasa
+                docs        = search_db(query)
+                web_results = []
 
-            if web_results:
-                ctx_parts.append("\n=== REFERENSI TEKNIS INTERNET ===")
-                for w in web_results:
-                    ctx_parts.append(f"[{w['title']}]\n{w['snippet']}")
+                if use_web and len(docs) < 2:
+                    web_query   = ' '.join(translate_query(query))
+                    web_results = web_search(web_query)
 
-            context = '\n\n---\n\n'.join(ctx_parts)
+                ctx_parts = []
+                if docs:
+                    ctx_parts.append("=== DOKUMEN INTERNAL PTSP ===")
+                    for d in docs:
+                        header = f"[{d['file_name']}]"
+                        if d.get('folder_path'):
+                            header += f" (📁 {d['folder_path']})"
+                        ctx_parts.append(f"{header}\n{d['content']}")
+                else:
+                    ctx_parts.append("=== DOKUMEN INTERNAL ===\nTidak ada dokumen relevan.")
 
-            system_prompt = """Anda adalah AI Assistant teknis untuk Unit Evaluasi Proses dan Energi PTSP (pabrik semen Indarung VI).
+                if web_results:
+                    ctx_parts.append("\n=== REFERENSI TEKNIS INTERNET ===")
+                    for w in web_results:
+                        ctx_parts.append(f"[{w['title']}]\n{w['snippet']}")
+
+                context = '\n\n---\n\n'.join(ctx_parts)
+
+                system_prompt = """Anda adalah AI Assistant teknis untuk Unit Evaluasi Proses dan Energi PTSP (pabrik semen Indarung VI).
 
 KODE EQUIPMENT (PENTING — jangan tertukar):
 - 6R1 = Raw Mill (OK Mill) — vertical roller mill untuk material mentah
@@ -392,68 +498,68 @@ ATURAN:
 8. Terjemahkan dokumen Inggris ke Indonesia dalam jawaban
 9. Jika dokumen tidak ditemukan, katakan terus terang dan sarankan folder yang tepat"""
 
-            try:
-                completion = groq_client.chat.completions.create(
-                    model=GROQ_MODEL,
-                    messages=[
-                        {'role': 'system', 'content': system_prompt},
-                        {'role': 'user', 'content': f"Konteks:\n{context}\n\nPertanyaan: {query}"}
-                    ],
-                    max_tokens=2000,
-                    temperature=0.1
-                )
-                answer = completion.choices[0].message.content
-                st.markdown(answer)
-
-                col1, col2 = st.columns(2)
-                with col1:
-                    excel_buf = generate_excel(answer, docs, query)
-                    st.download_button(
-                        label="📊 Download Excel",
-                        data=excel_buf,
-                        file_name=f"jawaban_ai_{query[:30].replace(' ','_')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"excel_{len(st.session_state.messages)}"
+                try:
+                    completion = groq_client.chat.completions.create(
+                        model=GROQ_MODEL,
+                        messages=[
+                            {'role': 'system', 'content': system_prompt},
+                            {'role': 'user', 'content': f"Konteks:\n{context}\n\nPertanyaan: {query}"}
+                        ],
+                        max_tokens=2000,
+                        temperature=0.1
                     )
-                with col2:
-                    docx_buf = generate_docx(answer, docs, query)
-                    st.download_button(
-                        label="📄 Download Word",
-                        data=docx_buf,
-                        file_name=f"jawaban_ai_{query[:30].replace(' ','_')}.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        key=f"docx_{len(st.session_state.messages)}"
-                    )
+                    answer = completion.choices[0].message.content
+                    st.markdown(answer)
 
-                if docs:
-                    html = '<div class="source-box">📄 <b>Sumber:</b><br>'
-                    for d in docs:
-                        label = d['file_name']
-                        if d.get('folder_path'):
-                            label += f" <i>({d['folder_path']})</i>"
-                        if d['file_path']:
-                            html += f'• <a href="{d["file_path"]}" target="_blank">{label}</a><br>'
-                        else:
-                            html += f'• {label}<br>'
-                    html += '</div>'
-                    st.markdown(html, unsafe_allow_html=True)
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        excel_buf = generate_excel_answer(answer, docs, query)
+                        st.download_button(
+                            label="📊 Download Excel",
+                            data=excel_buf,
+                            file_name=f"jawaban_ai_{query[:30].replace(' ','_')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"excel_{len(st.session_state.messages)}"
+                        )
+                    with col2:
+                        docx_buf = generate_docx(answer, docs, query)
+                        st.download_button(
+                            label="📄 Download Word",
+                            data=docx_buf,
+                            file_name=f"jawaban_ai_{query[:30].replace(' ','_')}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key=f"docx_{len(st.session_state.messages)}"
+                        )
 
-                if web_results:
-                    whtml = '<div class="web-box">🌐 <b>Referensi Internet:</b><br>'
-                    for w in web_results:
-                        if w['url']:
-                            whtml += f'• <a href="{w["url"]}" target="_blank">{w["title"][:70]}</a><br>'
-                    whtml += '</div>'
-                    st.markdown(whtml, unsafe_allow_html=True)
+                    if docs:
+                        html = '<div class="source-box">📄 <b>Sumber:</b><br>'
+                        for d in docs:
+                            label = d['file_name']
+                            if d.get('folder_path'):
+                                label += f" <i>({d['folder_path']})</i>"
+                            if d['file_path']:
+                                html += f'• <a href="{d["file_path"]}" target="_blank">{label}</a><br>'
+                            else:
+                                html += f'• {label}<br>'
+                        html += '</div>'
+                        st.markdown(html, unsafe_allow_html=True)
 
-                full = answer
-                if docs:
-                    full += '\n\n**Sumber:** ' + ', '.join(
-                        f"{d['file_name']} ({d.get('folder_path','')})" for d in docs
-                    )
-                st.session_state.messages.append({'role': 'assistant', 'content': full})
+                    if web_results:
+                        whtml = '<div class="web-box">🌐 <b>Referensi Internet:</b><br>'
+                        for w in web_results:
+                            if w['url']:
+                                whtml += f'• <a href="{w["url"]}" target="_blank">{w["title"][:70]}</a><br>'
+                        whtml += '</div>'
+                        st.markdown(whtml, unsafe_allow_html=True)
 
-            except Exception as e:
-                err = f'❌ Error: {e}'
-                st.error(err)
-                st.session_state.messages.append({'role': 'assistant', 'content': err})
+                    full = answer
+                    if docs:
+                        full += '\n\n**Sumber:** ' + ', '.join(
+                            f"{d['file_name']} ({d.get('folder_path','')})" for d in docs
+                        )
+                    st.session_state.messages.append({'role': 'assistant', 'content': full})
+
+                except Exception as e:
+                    err = f'❌ Error: {e}'
+                    st.error(err)
+                    st.session_state.messages.append({'role': 'assistant', 'content': err})
